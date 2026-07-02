@@ -12,21 +12,19 @@ import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.Constants;
 import net.runelite.api.GameObject;
-import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
+import net.runelite.api.ObjectComposition;
 import net.runelite.api.Scene;
-import net.runelite.api.Skill;
 import net.runelite.api.Tile;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.GameObjectDespawned;
 import net.runelite.api.events.GameObjectSpawned;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.GameState;
 import net.runelite.api.events.GameTick;
-import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.NpcDespawned;
 import net.runelite.api.events.NpcSpawned;
-import net.runelite.api.events.StatChanged;
 import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
@@ -44,60 +42,51 @@ import net.runelite.client.ui.overlay.OverlayManager;
 public class StymphikePlugin extends Plugin
 {
 	// ==========================================================================
-	// TODO: These are placeholders for brand-new content. Capture the real
-	// values in-game (see the README notes) and paste them here. Nothing else
-	// in the plugin needs to change once these are correct.
+	// IDs below were captured in-game via the dev tools; no gameval constants
+	// exist yet for this content. Update here if a game update changes them.
 	// ==========================================================================
 
 	/** The object name shown on the tree's right-click menu ("Check Stymphike tree"). */
 	static final String TREE_NAME = "Stymphike tree";
 
 	/**
-	 * Object IDs of the stymphike tree (captured via dev-tools). Matching by ID is
-	 * more reliable than by name for new content. Baiting keeps the same ID (only the
-	 * menu option changes), so these cover both baited and un-baited states.
+	 * Object IDs of the stymphike tree variants (one per tree in the area). The
+	 * trees are varbit-driven multilocs: baiting keeps the ID but swaps the active
+	 * form, which is how the menu changes between "Bait" and "Check".
 	 */
-	static final Set<Integer> TREE_IDS = Set.of(40782, 40783, 40785);
+	static final Set<Integer> TREE_IDS = Set.of(40782, 40783, 40784, 40785, 40786);
 
-	/** Object IDs of the hiding bush (captured via dev-tools). */
-	static final Set<Integer> BUSH_IDS = Set.of(40781);
+	/** Menu action present on a tree's active form only while it is baited. */
+	static final String BAITED_ACTION = "Check";
 
-	/** Menu option used to bait the tree. Adjust if the real option differs. */
-	static final String BAIT_OPTION = "Bait";
-
-	/** NPC IDs of the stymphike bird (captured via dev-tools). */
+	/** NPC IDs of the stymphike bird. */
 	static final Set<Integer> STYMPHIKE_NPC_IDS = Set.of(15747);
 
 	/** NPC name of the stymphike bird (fallback match, case-insensitive substring). */
 	static final String STYMPHIKE_NPC = "stymphike";
 
+	/**
+	 * Varbits observed (via the dev tools var inspector) to flip 0->1 on hiding in
+	 * a bush and back on exit. The tree varbits form a per-object block (15440,
+	 * 15442, ...), so 15444 may be specific to one bush while 16289 is the global
+	 * hidden flag — either being set means the player is hidden.
+	 */
+	static final int HIDDEN_VARBIT = 15444;
+
+	/** Companion hidden varbit; see HIDDEN_VARBIT. */
+	static final int HIDDEN_VARBIT_ALT = 16289;
+
 	/** Tiles within which a bird is considered "at" a baited tree (for association). */
 	static final int BIRD_ASSOC_DISTANCE = 2;
 
-	/** Tiles from a tree's base tile at which the player is close enough to have baited it. */
-	static final int BAIT_REACH = 2;
-
-	/** Ticks a pending bait waits for the player to reach the tree before being dropped. */
-	static final int PENDING_BAIT_TIMEOUT = 30;
-
-	/** Ticks a registered catch waits for the bird's (death-animation-delayed) despawn. */
+	/** Ticks a bird's death waits to be matched to its (animation-delayed) despawn. */
 	static final int CATCH_DESPAWN_TIMEOUT = 10;
 
 	/**
-	 * Minimum Hunter XP gained in one drop to count as a catch. Peeking gives 125,
-	 * a catch gives ~1,350 (scaled by damage), so anything above the peek amount is
-	 * a catch. 200 sits safely between the two.
+	 * If the bird despawns while its baited tile is further than this from the
+	 * player, it merely left our render distance (we walked away) — not an outcome.
 	 */
-	static final int CATCH_XP_THRESHOLD = 200;
-
-	/** The object name of the hiding bush ("Hide-in Bush" / "Exit Bush"). */
-	static final String BUSH_NAME = "Bush";
-
-	/** Menu verb to enter the bush. Menu splits as option="Hide-in", target="Bush". */
-	static final String HIDE_OPTION = "Hide-in";
-
-	/** Menu verb to leave the bush. */
-	static final String EXIT_OPTION = "Exit";
+	static final int DESPAWN_VIEW_DISTANCE = 15;
 
 	// ==========================================================================
 
@@ -114,61 +103,47 @@ public class StymphikePlugin extends Plugin
 	private StymphikeSceneOverlay overlay;
 
 	@Inject
+	private StymphikeStatusOverlay statusOverlay;
+
+	@Inject
 	private Notifier notifier;
 
 	@Inject
 	private StymphikeConfig config;
 
-	/** Last seen Hunter XP, used to compute per-drop gains. -1 until initialised. */
-	private int lastHunterXp = -1;
-
 	/** Every stymphike tree currently rendered in the scene. */
 	@Getter
 	private final Set<GameObject> trees = new HashSet<>();
 
-	/** World tiles of trees the player has baited. */
+	/**
+	 * Centre tiles of trees that are currently baited. Recomputed every tick from
+	 * each tree's varbit-driven active form, so it is always the game's own state.
+	 */
 	@Getter
 	private final Set<WorldPoint> baitedTiles = new HashSet<>();
 
 	/** Stymphike birds currently in the scene. */
+	@Getter
 	private final Set<NPC> stymphikes = new HashSet<>();
 
 	/** Bird index -> the baited tile it settled on, so we can clear it on despawn. */
 	private final Map<Integer, WorldPoint> birdBaitTile = new HashMap<>();
 
-	/** True after a catch until the caught bird's despawn is seen (or it times out). */
+	/** True after the bird dies until its despawn is seen (or it times out). */
 	private boolean pendingCatch;
 
 	/** Ticks left for a pending catch to be matched to a bird despawn. */
 	private int pendingCatchTicks;
 
-	/** Whether the player is currently hidden in a bush. */
+	/** Whether the player is currently hidden in a bush (read from HIDDEN_VARBIT). */
 	@Getter
 	private boolean hidden;
-
-	/** Tile the player hid on; used to detect when they walk out of the bush. */
-	private WorldPoint hidingTile;
-
-	/** Player location on the previous tick, used to know when they have settled. */
-	private WorldPoint lastLocation;
-
-	/** Bush tile the player is walking to hide in; committed once they stand on it. */
-	private WorldPoint pendingHideTile;
-
-	/** Tree tile the player is walking to bait; committed on arrival, else times out. */
-	private WorldPoint pendingBaitTile;
-
-	/** Ticks left to fulfil a pending bait before it is abandoned. */
-	private int pendingBaitTicks;
 
 	@Provides
 	StymphikeConfig provideConfig(ConfigManager configManager)
 	{
 		return configManager.getConfig(StymphikeConfig.class);
 	}
-
-	@Inject
-	private StymphikeStatusOverlay statusOverlay;
 
 	@Override
 	protected void startUp()
@@ -190,11 +165,7 @@ public class StymphikePlugin extends Plugin
 		stymphikes.clear();
 		birdBaitTile.clear();
 		hidden = false;
-		hidingTile = null;
-		pendingHideTile = null;
-		pendingBaitTile = null;
 		pendingCatch = false;
-		lastHunterXp = -1;
 	}
 
 	@Subscribe
@@ -212,11 +183,7 @@ public class StymphikePlugin extends Plugin
 			|| event.getGameState() == GameState.HOPPING)
 		{
 			setHidden(false);
-			pendingHideTile = null;
-			pendingBaitTile = null;
-			// Re-seed the XP baseline on next login so we don't misread the login
-			// StatChanged (or a different account's XP) as a catch.
-			lastHunterXp = -1;
+			birdBaitTile.clear();
 		}
 	}
 
@@ -234,43 +201,14 @@ public class StymphikePlugin extends Plugin
 			return;
 		}
 
-		final WorldPoint now = client.getLocalPlayer().getWorldLocation();
+		// The game tracks both states itself — read them rather than inferring from
+		// clicks and movement.
+		setHidden(client.getVarbitValue(HIDDEN_VARBIT) == 1
+			|| client.getVarbitValue(HIDDEN_VARBIT_ALT) == 1);
+		refreshBaitedTiles();
 
-		// Commit a pending hide only once the player is actually standing on the bush.
-		if (pendingHideTile != null && pendingHideTile.equals(now))
-		{
-			hidingTile = now;
-			pendingHideTile = null;
-			setHidden(true);
-		}
-
-		// Once hidden, stepping off the bush tile means the player is exposed again.
-		if (hidden && hidingTile != null && !hidingTile.equals(now))
-		{
-			setHidden(false);
-		}
-
-		// Commit a pending bait once the player has reached and stopped at the tree.
-		if (pendingBaitTile != null)
-		{
-			if (now.equals(lastLocation) && now.distanceTo(pendingBaitTile) <= BAIT_REACH)
-			{
-				baitedTiles.add(pendingBaitTile);
-				log.debug("Baited stymphike tree at {}", pendingBaitTile);
-				pendingBaitTile = null;
-			}
-			else if (--pendingBaitTicks <= 0)
-			{
-				// Player never reached the tree (walked off / cancelled) — drop it.
-				pendingBaitTile = null;
-			}
-		}
-
-		lastLocation = now;
-
-		// Associate any bird sitting on a baited tree with that tile, so we can clear
-		// the mark (and tell catch from flee) when the bird later despawns — even if
-		// it flies away first.
+		// Associate any bird sitting on a baited tree with that tile, so we can tell
+		// catch from flee when the bird later despawns — even if it flies away first.
 		if (!baitedTiles.isEmpty())
 		{
 			for (NPC bird : stymphikes)
@@ -292,6 +230,50 @@ public class StymphikePlugin extends Plugin
 		}
 	}
 
+	/** Rebuilds the baited set from each tracked tree's current varbit-driven form. */
+	private void refreshBaitedTiles()
+	{
+		baitedTiles.clear();
+		for (GameObject tree : trees)
+		{
+			if (isTreeBaited(tree))
+			{
+				baitedTiles.add(tree.getWorldLocation());
+			}
+		}
+	}
+
+	/** A tree is baited when its active form carries the "Check" menu action. */
+	private boolean isTreeBaited(GameObject tree)
+	{
+		ObjectComposition comp = client.getObjectDefinition(tree.getId());
+		if (comp == null)
+		{
+			return false;
+		}
+		if (comp.getImpostorIds() != null)
+		{
+			comp = comp.getImpostor();
+			if (comp == null)
+			{
+				return false;
+			}
+		}
+		final String[] actions = comp.getActions();
+		if (actions == null)
+		{
+			return false;
+		}
+		for (String action : actions)
+		{
+			if (BAITED_ACTION.equalsIgnoreCase(action))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private void setHidden(boolean value)
 	{
 		if (hidden == value)
@@ -299,13 +281,9 @@ public class StymphikePlugin extends Plugin
 			return;
 		}
 		hidden = value;
-		if (!value)
+		if (!value && config.notifyWhenExposed())
 		{
-			hidingTile = null;
-			if (config.notifyWhenExposed())
-			{
-				notifier.notify("You are no longer hidden — stymphikes will not approach.");
-			}
+			notifier.notify("You are no longer hidden — stymphikes will not approach.");
 		}
 	}
 
@@ -326,70 +304,23 @@ public class StymphikePlugin extends Plugin
 	}
 
 	@Subscribe
-	public void onMenuOptionClicked(MenuOptionClicked event)
-	{
-		final MenuAction type = event.getMenuAction();
-		final boolean isObjectAction =
-			type == MenuAction.GAME_OBJECT_FIRST_OPTION
-			|| type == MenuAction.GAME_OBJECT_SECOND_OPTION
-			|| type == MenuAction.GAME_OBJECT_THIRD_OPTION
-			|| type == MenuAction.GAME_OBJECT_FOURTH_OPTION
-			|| type == MenuAction.GAME_OBJECT_FIFTH_OPTION;
-
-		if (!isObjectAction)
-		{
-			return;
-		}
-
-		final String option = event.getMenuOption();
-		final String target = net.runelite.client.util.Text.removeTags(event.getMenuTarget());
-		// For object menu actions this is the object ID.
-		final int objectId = event.getId();
-
-		final boolean isTree = TREE_IDS.contains(objectId) || TREE_NAME.equalsIgnoreCase(target);
-		final boolean isBush = BUSH_IDS.contains(objectId) || BUSH_NAME.equalsIgnoreCase(target);
-
-		// --- Bait a stymphike tree ---
-		// Only a pending target here; it is committed once the player actually reaches
-		// the tree (see onGameTick), not on the click while still walking over.
-		if (config.highlightBaited() && isTree && BAIT_OPTION.equalsIgnoreCase(option))
-		{
-			pendingBaitTile = WorldPoint.fromScene(
-				client,
-				event.getParam0(),
-				event.getParam1(),
-				client.getPlane());
-			pendingBaitTicks = PENDING_BAIT_TIMEOUT;
-			return;
-		}
-
-		// --- Hide in / exit the bush ---
-		if (isBush)
-		{
-			if (HIDE_OPTION.equalsIgnoreCase(option))
-			{
-				// Committed only once the player stands on the bush tile (onGameTick),
-				// not on the click while still walking there.
-				pendingHideTile = WorldPoint.fromScene(
-					client,
-					event.getParam0(),
-					event.getParam1(),
-					client.getPlane());
-			}
-			else if (EXIT_OPTION.equalsIgnoreCase(option))
-			{
-				pendingHideTile = null;
-				setHidden(false);
-			}
-		}
-	}
-
-	@Subscribe
 	public void onNpcSpawned(NpcSpawned event)
 	{
 		if (isStymphikeNpc(event.getNpc()))
 		{
 			stymphikes.add(event.getNpc());
+		}
+	}
+
+	@Subscribe
+	public void onActorDeath(ActorDeath event)
+	{
+		// The bird dying (rather than flying off) is what distinguishes a catch from
+		// a flee — a failed spear also pays XP, so XP alone can't tell them apart.
+		if (stymphikes.contains(event.getActor()))
+		{
+			pendingCatch = true;
+			pendingCatchTicks = CATCH_DESPAWN_TIMEOUT;
 		}
 	}
 
@@ -410,17 +341,28 @@ public class StymphikePlugin extends Plugin
 			return;
 		}
 
-		// The bait is gone either way; clear the mark.
-		baitedTiles.remove(tile);
-
-		if (pendingCatch)
+		// The bird only left our render distance because the player walked away —
+		// the outcome is unknown, so say nothing.
+		if (client.getLocalPlayer() == null
+			|| client.getLocalPlayer().getWorldLocation().distanceTo(tile) > DESPAWN_VIEW_DISTANCE)
 		{
-			// This despawn is the caught bird's death (which lags the catch XP by a
-			// few ticks of death animation) — not a flee.
+			return;
+		}
+
+		if (pendingCatch || npc.isDead())
+		{
+			// The bird died: a successful catch (the despawn lags the death by a few
+			// ticks of death animation).
 			pendingCatch = false;
+
+			if (config.notifyOnCatch())
+			{
+				announce("You caught a stymphike!");
+			}
 		}
 		else if (config.notifyOnFlee())
 		{
+			// Despawned alive: it flew off with the bait.
 			announce("A stymphike fled with your bait!");
 		}
 	}
@@ -446,46 +388,6 @@ public class StymphikePlugin extends Plugin
 		return name != null && name.toLowerCase().contains(STYMPHIKE_NPC);
 	}
 
-	@Subscribe
-	public void onStatChanged(StatChanged event)
-	{
-		if (event.getSkill() != Skill.HUNTER)
-		{
-			return;
-		}
-
-		final int xp = event.getXp();
-
-		// First reading just seeds the baseline — don't treat login as a catch.
-		if (lastHunterXp < 0)
-		{
-			lastHunterXp = xp;
-			return;
-		}
-
-		final int gained = xp - lastHunterXp;
-		lastHunterXp = xp;
-
-		if (gained >= CATCH_XP_THRESHOLD)
-		{
-			registerCatch();
-		}
-	}
-
-	/** Common handling for a confirmed catch. */
-	private void registerCatch()
-	{
-		// Flag the catch so the caught bird's later despawn is read as a catch, not a
-		// flee. The baited tile is cleared when the bird despawns (see onNpcDespawned).
-		pendingCatch = true;
-		pendingCatchTicks = CATCH_DESPAWN_TIMEOUT;
-
-		if (config.notifyOnCatch())
-		{
-			announce("You caught a stymphike!");
-		}
-	}
-
 	private boolean isStymphikeTree(GameObject obj)
 	{
 		if (obj == null)
@@ -497,11 +399,11 @@ public class StymphikePlugin extends Plugin
 			return true;
 		}
 		// Fall back to a name match in case the tree has an untracked variant ID.
-		final var comp = client.getObjectDefinition(obj.getId());
+		final ObjectComposition comp = client.getObjectDefinition(obj.getId());
 		return comp != null && TREE_NAME.equalsIgnoreCase(comp.getName());
 	}
 
-	/** Scans the whole loaded scene for stymphike trees and repopulates the set. */
+	/** Scans the whole loaded scene for stymphike trees to repopulate the set. */
 	private void rebuildTrees()
 	{
 		trees.clear();

@@ -87,7 +87,7 @@ public interface StymphikeConfig extends Config
 	@ConfigItem(
 		keyName = "baitedColor",
 		name = "Baited tree colour",
-		description = "Outline colour for trees you have baited.",
+		description = "Marker colour for trees you have baited.",
 		section = markingSection,
 		position = 2
 	)
@@ -99,7 +99,7 @@ public interface StymphikeConfig extends Config
 	@ConfigItem(
 		keyName = "treeColor",
 		name = "Tree colour",
-		description = "Outline colour for un-baited stymphike trees.",
+		description = "Marker colour for un-baited stymphike trees.",
 		section = markingSection,
 		position = 3
 	)
@@ -109,23 +109,27 @@ public interface StymphikeConfig extends Config
 	}
 
 	@ConfigItem(
-		keyName = "renderStyle",
-		name = "Marker style",
-		description = "How a tree is marked: a small centre circle (like a trap marker), the tile, a full outline, or the clickbox.",
+		keyName = "highlightStymphike",
+		name = "Outline stymphike",
+		description = "Outlines the stymphike bird when it appears, so you can spot and spear it quickly.",
 		section = markingSection,
 		position = 4
 	)
-	default RenderStyle renderStyle()
+	default boolean highlightStymphike()
 	{
-		return RenderStyle.CIRCLE;
+		return true;
 	}
 
-	enum RenderStyle
+	@ConfigItem(
+		keyName = "stymphikeColor",
+		name = "Stymphike colour",
+		description = "Outline colour for the stymphike bird.",
+		section = markingSection,
+		position = 5
+	)
+	default Color stymphikeColor()
 	{
-		CIRCLE,
-		TILE,
-		OUTLINE,
-		CLICKBOX
+		return new Color(255, 140, 0);
 	}
 
 	// ---- Hiding ----
