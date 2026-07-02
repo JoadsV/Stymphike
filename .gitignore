@@ -1,0 +1,13 @@
+.gradle
+build
+.idea/
+.project
+.settings/
+.classpath
+nbactions.xml
+nb-configuration.xml
+nbproject/
+
+# Agent / dev-assistant guidance — not part of the plugin
+AGENTS.md
+CLAUDE.md
