@@ -76,17 +76,11 @@ public class StymphikePlugin extends Plugin
 	/** Companion hidden varbit; see HIDDEN_VARBIT. */
 	static final int HIDDEN_VARBIT_ALT = 16289;
 
-	/** Tiles within which a bird is considered "at" a baited tree (for association). */
-	static final int BIRD_ASSOC_DISTANCE = 2;
+	/** Ticks after a catch/flee during which the "no longer hidden" nag is suppressed. */
+	static final int RESOLVE_SUPPRESS_TICKS = 2;
 
-	/** Ticks a bird's death waits to be matched to its (animation-delayed) despawn. */
-	static final int CATCH_DESPAWN_TIMEOUT = 10;
-
-	/**
-	 * If the bird despawns while its baited tile is further than this from the
-	 * player, it merely left our render distance (we walked away) — not an outcome.
-	 */
-	static final int DESPAWN_VIEW_DISTANCE = 15;
+	/** Tiles from a just-consumed bait within which the taking bird is identified. */
+	static final int ENGAGE_RADIUS = 6;
 
 	// ==========================================================================
 
@@ -126,18 +120,21 @@ public class StymphikePlugin extends Plugin
 	@Getter
 	private final Set<NPC> stymphikes = new HashSet<>();
 
-	/** Bird index -> the baited tile it settled on, so we can clear it on despawn. */
-	private final Map<Integer, WorldPoint> birdBaitTile = new HashMap<>();
+	/** Baited tiles as of the previous tick, to detect bait being consumed. */
+	private final Set<WorldPoint> prevBaitedTiles = new HashSet<>();
 
-	/** True after the bird dies until its despawn is seen (or it times out). */
-	private boolean pendingCatch;
+	/** Bird index -> the tile whose bait it took, set when that bait is consumed. */
+	private final Map<Integer, WorldPoint> engagedBirds = new HashMap<>();
 
-	/** Ticks left for a pending catch to be matched to a bird despawn. */
-	private int pendingCatchTicks;
+	/** Indices of stymphikes that died (were caught), so their despawn isn't read as a flee. */
+	private final Set<Integer> diedBirds = new HashSet<>();
 
 	/** Whether the player is currently hidden in a bush (read from HIDDEN_VARBIT). */
 	@Getter
 	private boolean hidden;
+
+	/** Game tick of the last catch/flee, used to suppress the follow-on exposed nag. */
+	private int lastResolveTick = -100;
 
 	@Provides
 	StymphikeConfig provideConfig(ConfigManager configManager)
@@ -163,9 +160,10 @@ public class StymphikePlugin extends Plugin
 		trees.clear();
 		baitedTiles.clear();
 		stymphikes.clear();
-		birdBaitTile.clear();
+		prevBaitedTiles.clear();
+		engagedBirds.clear();
+		diedBirds.clear();
 		hidden = false;
-		pendingCatch = false;
 	}
 
 	@Subscribe
@@ -176,26 +174,24 @@ public class StymphikePlugin extends Plugin
 		{
 			trees.clear();
 			stymphikes.clear();
-			birdBaitTile.clear();
+			prevBaitedTiles.clear();
+			engagedBirds.clear();
+			diedBirds.clear();
 		}
 
 		if (event.getGameState() == GameState.LOGIN_SCREEN
 			|| event.getGameState() == GameState.HOPPING)
 		{
 			setHidden(false);
-			birdBaitTile.clear();
+			prevBaitedTiles.clear();
+			engagedBirds.clear();
+			diedBirds.clear();
 		}
 	}
 
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
-		// Drop a pending catch that never got matched to a despawn (safety net).
-		if (pendingCatch && --pendingCatchTicks <= 0)
-		{
-			pendingCatch = false;
-		}
-
 		if (client.getLocalPlayer() == null)
 		{
 			return;
@@ -206,28 +202,63 @@ public class StymphikePlugin extends Plugin
 		setHidden(client.getVarbitValue(HIDDEN_VARBIT) == 1
 			|| client.getVarbitValue(HIDDEN_VARBIT_ALT) == 1);
 		refreshBaitedTiles();
+		linkConsumedBaitToBird();
+	}
 
-		// Associate any bird sitting on a baited tree with that tile, so we can tell
-		// catch from flee when the bird later despawns — even if it flies away first.
-		if (!baitedTiles.isEmpty())
+	/**
+	 * When a tree's bait is consumed, links the bird that took it to that tile. That
+	 * bird's later fate decides the outcome: it dies (caught) or despawns alive (fled).
+	 */
+	private void linkConsumedBaitToBird()
+	{
+		for (WorldPoint tile : prevBaitedTiles)
 		{
-			for (NPC bird : stymphikes)
+			// The tree is still there but no longer baited => a bird took the bait.
+			// (A despawned tree is a scene change, not a consumption.)
+			if (!baitedTiles.contains(tile) && treeExistsAt(tile))
 			{
-				final WorldPoint birdLoc = bird.getWorldLocation();
-				if (birdLoc == null || birdBaitTile.containsKey(bird.getIndex()))
-				{
-					continue;
-				}
-				for (WorldPoint tile : baitedTiles)
-				{
-					if (birdLoc.distanceTo(tile) <= BIRD_ASSOC_DISTANCE)
-					{
-						birdBaitTile.put(bird.getIndex(), tile);
-						break;
-					}
-				}
+				engageNearestBird(tile);
 			}
 		}
+		prevBaitedTiles.clear();
+		prevBaitedTiles.addAll(baitedTiles);
+	}
+
+	/** Marks the stymphike nearest a just-consumed bait as the bird that took it. */
+	private void engageNearestBird(WorldPoint tile)
+	{
+		NPC nearest = null;
+		int best = Integer.MAX_VALUE;
+		for (NPC bird : stymphikes)
+		{
+			final WorldPoint loc = bird.getWorldLocation();
+			if (loc == null)
+			{
+				continue;
+			}
+			final int d = loc.distanceTo(tile);
+			if (d <= ENGAGE_RADIUS && d < best)
+			{
+				best = d;
+				nearest = bird;
+			}
+		}
+		if (nearest != null)
+		{
+			engagedBirds.put(nearest.getIndex(), tile);
+		}
+	}
+
+	private boolean treeExistsAt(WorldPoint tile)
+	{
+		for (GameObject tree : trees)
+		{
+			if (tile.equals(tree.getWorldLocation()))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Rebuilds the baited set from each tracked tree's current varbit-driven form. */
@@ -281,7 +312,14 @@ public class StymphikePlugin extends Plugin
 			return;
 		}
 		hidden = value;
-		if (!value && config.notifyWhenExposed())
+		// Only nag when you become exposed with bait waiting and no bird around — i.e.
+		// you wandered out, not when a stymphike ejected you to be speared (a catch),
+		// and not right after resolving one.
+		if (!value
+			&& config.notifyWhenExposed()
+			&& !baitedTiles.isEmpty()
+			&& stymphikes.isEmpty()
+			&& client.getTickCount() - lastResolveTick > RESOLVE_SUPPRESS_TICKS)
 		{
 			notifier.notify("You are no longer hidden — stymphikes will not approach.");
 		}
@@ -315,12 +353,19 @@ public class StymphikePlugin extends Plugin
 	@Subscribe
 	public void onActorDeath(ActorDeath event)
 	{
-		// The bird dying (rather than flying off) is what distinguishes a catch from
-		// a flee — a failed spear also pays XP, so XP alone can't tell them apart.
-		if (stymphikes.contains(event.getActor()))
+		// A stymphike only ever dies by being speared — so its death IS the catch.
+		if (!stymphikes.contains(event.getActor()))
 		{
-			pendingCatch = true;
-			pendingCatchTicks = CATCH_DESPAWN_TIMEOUT;
+			return;
+		}
+		// Remember it died so its later despawn is not also read as a flee.
+		if (event.getActor() instanceof NPC)
+		{
+			diedBirds.add(((NPC) event.getActor()).getIndex());
+		}
+		if (config.notifyOnCatch())
+		{
+			announce("You caught a stymphike!");
 		}
 	}
 
@@ -332,37 +377,12 @@ public class StymphikePlugin extends Plugin
 		{
 			return;
 		}
-
-		// Was this bird sitting on one of our baited trees? If not, it just wandered
-		// out of range — ignore it.
-		final WorldPoint tile = birdBaitTile.remove(npc.getIndex());
-		if (tile == null)
+		final int idx = npc.getIndex();
+		final boolean died = diedBirds.remove(idx);
+		final WorldPoint tookBaitFrom = engagedBirds.remove(idx);
+		// Died = caught (already announced). Despawned alive after taking our bait = fled.
+		if (!died && tookBaitFrom != null && config.notifyOnFlee())
 		{
-			return;
-		}
-
-		// The bird only left our render distance because the player walked away —
-		// the outcome is unknown, so say nothing.
-		if (client.getLocalPlayer() == null
-			|| client.getLocalPlayer().getWorldLocation().distanceTo(tile) > DESPAWN_VIEW_DISTANCE)
-		{
-			return;
-		}
-
-		if (pendingCatch || npc.isDead())
-		{
-			// The bird died: a successful catch (the despawn lags the death by a few
-			// ticks of death animation).
-			pendingCatch = false;
-
-			if (config.notifyOnCatch())
-			{
-				announce("You caught a stymphike!");
-			}
-		}
-		else if (config.notifyOnFlee())
-		{
-			// Despawned alive: it flew off with the bait.
 			announce("A stymphike fled with your bait!");
 		}
 	}
@@ -372,6 +392,8 @@ public class StymphikePlugin extends Plugin
 	{
 		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, null);
 		notifier.notify(message);
+		// Mark the resolution so the follow-on "no longer hidden" nag is suppressed.
+		lastResolveTick = client.getTickCount();
 	}
 
 	private boolean isStymphikeNpc(NPC npc)
